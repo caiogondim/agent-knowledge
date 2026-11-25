@@ -33,6 +33,11 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+/// Where the sync keeps the last synced state of each folder.
+fn known_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(memory::home_dir(env)?.join("known"))
+}
+
 /// Claim `folder` as this session's one memory. Fails if the session already runs one.
 fn claim(kind: Kind, folder: &Path) -> anyhow::Result<Claim> {
     let folder = std::path::absolute(folder).with_context(|| format!("bad folder {}", folder.display()))?;
@@ -82,13 +87,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Share { folder } => {
             let _claim = claim(Kind::Share, &folder)?;
             let print_hash = |hash: &str| println!("{hash}");
-            agent_knowledge::sync::run(folder, None, print_hash, shutdown).await
+            agent_knowledge::sync::run(folder, None, known_dir()?, print_hash, shutdown).await
         }
         Command::Mount { hash, target } => {
             let _claim = claim(Kind::Mount, &target)?;
             std::fs::create_dir_all(&target)?;
             let announce = |_: &str| eprintln!("mounted at {}", target.display());
-            agent_knowledge::sync::run(target.clone(), Some(hash), announce, shutdown).await
+            agent_knowledge::sync::run(target.clone(), Some(hash), known_dir()?, announce, shutdown).await
         }
         Command::Plug { agents } => run_plug(agents),
         Command::Status => status(),

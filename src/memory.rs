@@ -61,15 +61,20 @@ pub fn session_id(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<String
     Ok(id)
 }
 
-/// The folder that holds one entry per session.
-pub fn registry_dir(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<PathBuf> {
+/// The folder that holds what agent-knowledge keeps on this machine.
+pub fn home_dir(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<PathBuf> {
     if let Some(home) = env("AGENT_KNOWLEDGE_HOME").filter(|dir| !dir.is_empty()) {
-        return Ok(PathBuf::from(home).join("sessions"));
+        return Ok(PathBuf::from(home));
     }
     let Some(home) = env("HOME").filter(|dir| !dir.is_empty()) else {
         bail!("cannot find the session registry: HOME is not set");
     };
-    Ok(PathBuf::from(home).join(".agent-knowledge").join("sessions"))
+    Ok(PathBuf::from(home).join(".agent-knowledge"))
+}
+
+/// The folder that holds one entry per session.
+pub fn registry_dir(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<PathBuf> {
+    Ok(home_dir(env)?.join("sessions"))
 }
 
 /// The memory that `session` runs, if its process is still alive.

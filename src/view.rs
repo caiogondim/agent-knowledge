@@ -28,8 +28,8 @@ pub enum Content {
     Tombstone,
 }
 
-/// The winner of 1 path: the content, and a ticket from each slice that holds the same content at
-/// the same clock.
+/// The winner of 1 path: the content, and a ticket from each slice that holds the same bytes, at
+/// any clock. A peer with the same bytes is a source whatever its clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Winner {
     pub clock: u64,
@@ -77,7 +77,6 @@ impl View {
         };
         let tickets = entries
             .iter()
-            .filter(|entry| entry.clock == best.clock)
             .filter_map(|entry| match (&entry.content, &sha256) {
                 (Content::File { sha256: sha, ticket }, Some(want)) if sha == want => Some(ticket.clone()),
                 _ => None,
@@ -86,11 +85,17 @@ impl View {
         Some(Winner { clock: best.clock, sha256, tickets })
     }
 
-    /// The clock for a new local change to `path`: 1 above the highest clock that any slice holds.
+    /// The clock for a new local change to `path`: 1 above the highest clock that any slice holds,
+    /// and above `own`, the clock that this peer last wrote or saw for the path. A peer that
+    /// starts again can see an empty view, and `own` keeps its clock from falling behind.
     /// `None` if the clock would overflow.
-    pub fn next_clock(&self, path: &str) -> Option<u64> {
+    pub fn next_clock(&self, path: &str, own: u64) -> Option<u64> {
         let highest = self.entries.get(path).and_then(|entries| entries.iter().map(|entry| entry.clock).max());
-        highest.unwrap_or(0).checked_add(1)
+        highest.unwrap_or(0).max(own).checked_add(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -184,13 +189,13 @@ mod tests {
     }
 
     #[test]
-    fn a_ticket_of_another_content_or_clock_is_not_offered() {
+    fn a_ticket_of_the_same_bytes_is_offered_at_any_clock_and_other_bytes_are_not() {
         let view = view(json!({
-            "a": { "files": { "x": file("11", "old", 3) } },
+            "a": { "files": { "x": file("33", "older-same-bytes", 3) } },
             "b": { "files": { "x": file("22", "same-clock-other-bytes", 4) } },
             "c": { "files": { "x": file("33", "win", 4) } },
         }));
-        assert_eq!(view.winner("x").unwrap().tickets, ["win"]);
+        assert_eq!(view.winner("x").unwrap().tickets, ["older-same-bytes", "win"]);
     }
 
     #[test]
@@ -199,14 +204,23 @@ mod tests {
             "a": { "files": { "x": file("11", "t", 4) } },
             "b": { "files": { "x": tombstone(9) } },
         }));
-        assert_eq!(view.next_clock("x"), Some(10));
-        assert_eq!(view.next_clock("unknown"), Some(1));
+        assert_eq!(view.next_clock("x", 0), Some(10));
+        assert_eq!(view.next_clock("unknown", 0), Some(1));
+    }
+
+    #[test]
+    fn the_next_clock_is_above_the_own_clock_when_the_view_is_behind() {
+        let empty = View::default();
+        assert_eq!(empty.next_clock("x", 3), Some(4));
+        let behind = view(json!({ "a": { "files": { "x": file("11", "t", 1) } } }));
+        assert_eq!(behind.next_clock("x", 3), Some(4));
     }
 
     #[test]
     fn the_next_clock_does_not_overflow() {
         let view = view(json!({ "a": { "files": { "x": file("11", "t", u64::MAX) } } }));
-        assert_eq!(view.next_clock("x"), None);
+        assert_eq!(view.next_clock("x", 0), None);
+        assert_eq!(View::default().next_clock("x", u64::MAX), None);
     }
 
     #[test]

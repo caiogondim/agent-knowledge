@@ -127,11 +127,12 @@ cargo clippy
 
 - **The hash** is a habilis-network mesh id. The mesh uses all lookups: mDNS, DHT, and relay.
 - **The file list** is the mesh `state` document. Each peer writes its full view of the folder into its own signed slice. Each entry holds the sha256 of a file, a blob ticket, and a `clock`. A delete is an entry with `deleted: true`.
-- **The file bytes** go through the blob ticket, because a gossip frame holds at most 3840 bytes.
+- **The file bytes** go through the blob ticket, because a gossip frame holds at most 3840 bytes. A download runs in the background and fails when no byte arrives for 10 s.
 - **Echo stop:** each side keeps the last synced sha256 of each path. A change that matches it is the side's own echo, so the side skips it.
 - **Conflicts:** for each path, the entry with the highest `clock` wins. On a tie, a file beats a delete, and between 2 files the larger sha256 wins. A local change gets a clock 1 above the highest clock in all slices.
 - **Adoption:** a peer that applies a winner copies it into its own slice, with its own blob ticket. So the folder survives when the share stops, and a fetch has more than 1 source.
-- **Restart:** each peer saves the last synced state of each path in `$AGENT_KNOWLEDGE_HOME/known/` (default `~/.agent-knowledge/known/`). A file that differs from it at start is an offline edit, and it wins.
+- **Restart:** each peer saves the last synced state of each path, for each mesh and folder, in `$AGENT_KNOWLEDGE_HOME/known/` (default `~/.agent-knowledge/known/`). A file that differs from it at start is an offline edit, and it wins. A saved delete is published again too.
+- **Join:** a file in the folder at join that no earlier run synced yields to the mesh. If a peer already holds that path as a file, its version overwrites the file. A path that no peer holds, or that peers deleted, is published.
 
 ### Limits
 
