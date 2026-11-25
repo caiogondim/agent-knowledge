@@ -3,7 +3,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{WAIT_LIMIT, WAIT_STEP, start_mesh, wait_for};
+use common::{Folder, WAIT_LIMIT, WAIT_STEP, start_mesh, wait_for};
 
 const STABLE_FOR: Duration = Duration::from_secs(3);
 
@@ -13,11 +13,11 @@ fn read(path: &Path) -> Option<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writes_converge_on_one_write() {
-    let a_dir = tempfile::tempdir().unwrap();
-    let b_dir = tempfile::tempdir().unwrap();
+    let a_dir = Folder::new();
+    let b_dir = Folder::new();
     std::fs::write(a_dir.path().join("ready.md"), "linked").unwrap();
 
-    let (_, [a, b]) = start_mesh([a_dir.path(), b_dir.path()]).await;
+    let (_, [a, b]) = start_mesh([&a_dir, &b_dir]).await;
     wait_for(&b_dir.path().join("ready.md"), Some("linked")).await;
 
     let a_path = a_dir.path().join("same.md");

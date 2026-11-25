@@ -1,15 +1,15 @@
 mod common;
 
-use common::{Pair, wait_for};
+use common::{Folder, Pair, wait_for};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn edits_flow_both_ways() {
-    let share_dir = tempfile::tempdir().unwrap();
-    let mount_dir = tempfile::tempdir().unwrap();
+    let share_dir = Folder::new();
+    let mount_dir = Folder::new();
     std::fs::create_dir(share_dir.path().join("sub")).unwrap();
     std::fs::write(share_dir.path().join("sub/start.md"), "from share").unwrap();
 
-    let pair = Pair::start(share_dir.path(), mount_dir.path()).await;
+    let pair = Pair::start(&share_dir, &mount_dir).await;
 
     wait_for(&mount_dir.path().join("sub/start.md"), Some("from share")).await;
 

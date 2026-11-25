@@ -1,6 +1,6 @@
 mod common;
 
-use common::{start_mesh, wait_for};
+use common::{Folder, start_mesh, wait_for};
 
 const FILE_COUNT: usize = 25;
 const EDIT_COUNT: usize = 10;
@@ -11,13 +11,13 @@ fn name(i: usize) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn many_files_flow_both_ways() {
-    let a_dir = tempfile::tempdir().unwrap();
-    let b_dir = tempfile::tempdir().unwrap();
+    let a_dir = Folder::new();
+    let b_dir = Folder::new();
     for i in 0..FILE_COUNT {
         std::fs::write(a_dir.path().join(name(i)), format!("a wrote {i}")).unwrap();
     }
 
-    let (_, [a, b]) = start_mesh([a_dir.path(), b_dir.path()]).await;
+    let (_, [a, b]) = start_mesh([&a_dir, &b_dir]).await;
     for i in 0..FILE_COUNT {
         wait_for(&b_dir.path().join(name(i)), Some(&format!("a wrote {i}"))).await;
     }
