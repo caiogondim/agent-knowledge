@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -27,6 +28,7 @@ use habilis_network::ops::blob::{self, BlobServer, BlobTicket, ContentId};
 use habilis_network::protocol::{Lookup, LookupOpts};
 use habilis_network::runtime::{SendError, SliceError};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWrite;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -43,6 +45,7 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(2);
 /// A fetch fails when no byte arrives for this long. A big file is not cut off while it flows.
 const FETCH_IDLE_LIMIT: Duration = Duration::from_secs(10);
 const MAX_FETCHES: usize = 8;
+const DIGEST_BLOCK_BYTES: usize = 64 * 1024;
 /// A joiner waits this long for a slice that holds files before its first publish.
 const FIRST_PUBLISH_WAIT: Duration = Duration::from_secs(5);
 /// One slice holds at most 1 MiB. An entry is about 520 bytes: a 407 byte ticket (measured), a
@@ -108,6 +111,7 @@ pub async fn run(
         started: Instant::now(),
         capped: false,
         overflowed: HashSet::new(),
+        unpublished: HashSet::new(),
         fetches: JoinSet::new(),
         in_flight: HashMap::new(),
         fetch_slots: Arc::new(Semaphore::new(MAX_FETCHES)),
@@ -171,6 +175,8 @@ struct Folder {
     capped: bool,
     /// The paths whose clock overflowed, so each is logged once.
     overflowed: HashSet<String>,
+    /// The paths of a read-only peer that it keeps and does not publish, so each is logged once.
+    unpublished: HashSet<String>,
     fetches: JoinSet<Fetched>,
     /// The `(clock, sha256)` that each running fetch is for.
     in_flight: HashMap<String, (u64, String)>,
@@ -252,6 +258,21 @@ impl Folder {
 
         let local_change = disk != known_sha && !disk_is_winner && !mesh_wins;
         let reverts = local_change && self.read_only();
+        // No live entry covers the path, so a read-only peer has nothing to revert the file to. It
+        // keeps the file, and a file that the mesh never gave it is not deleted by a tombstone.
+        let nothing_to_revert = reverts
+            && match &winner {
+                None => true,
+                Some(winner) => winner.sha256.is_none() && known.is_none(),
+            };
+        if nothing_to_revert {
+            if self.unpublished.insert(path.to_owned()) {
+                eprintln!("read-only share: not published {path}");
+            }
+            if winner.is_some() {
+                return;
+            }
+        }
 
         // A change on disk that no slice holds yet wins over everything: publish it above the
         // highest clock. A read-only peer follows the winner instead.
@@ -325,7 +346,7 @@ impl Folder {
 
     /// Stage an entry for our slice: a file with a ticket from our own blob server, or a tombstone.
     async fn stage(&self, path: &str, known: Known, pending: &mut Pending) {
-        let Some(known) = self.sealed(path, known) else { return };
+        let Some(known) = self.sealed(path, known).await else { return };
         // A merge sets keys only, so each entry nulls the keys of the other kind.
         let mut entry = match &known.sha256 {
             Some(sha) => match self.blobs.register(&self.root.join(path), ContentId::new(sha)).await {
@@ -346,19 +367,19 @@ impl Folder {
     /// The entry as it goes into our slice, or `None` if it must not go in. The creator signs it.
     /// A file that does not match its sha256 on disk would get a dead ticket, so it stays out. A
     /// read-only peer passes on only the signature that it got.
-    fn sealed(&self, path: &str, mut known: Known) -> Option<Known> {
+    async fn sealed(&self, path: &str, mut known: Known) -> Option<Known> {
         let Some(sha256) = known.sha256.clone() else {
             if let Some(key) = &self.creator_key {
                 known.sig = Some(key.sign(&self.mesh_id, &Signed::Tombstone { path, clock: known.clock }));
             }
             return Some(known);
         };
-        let bytes = std::fs::read(self.root.join(path)).ok()?;
-        if sha256_bytes(&bytes) != sha256 {
+        let file = self.root.join(path);
+        let (on_disk, size) = tokio::task::spawn_blocking(move || digest_file(&file)).await.ok()?.ok()?;
+        if on_disk != sha256 {
             return None;
         }
         if let Some(key) = &self.creator_key {
-            let size = u64::try_from(bytes.len()).ok()?;
             let signed = Signed::File { path, clock: known.clock, sha256: &sha256, size };
             known.sig = Some(key.sign(&self.mesh_id, &signed));
             known.size = Some(size);
@@ -500,6 +521,22 @@ enum Merge {
     /// The slice is past its size cap.
     Full,
     Failed(anyhow::Error),
+}
+
+/// The sha256 and the length of a file. It reads in blocks, so a big file is not held in memory.
+fn digest_file(path: &Path) -> std::io::Result<(String, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut block = [0u8; DIGEST_BLOCK_BYTES];
+    let mut length = 0u64;
+    loop {
+        let read = file.read(&mut block)?;
+        if read == 0 {
+            return Ok((hex::encode(hasher.finalize()), length));
+        }
+        hasher.update(&block[..read]);
+        length += read as u64;
+    }
 }
 
 fn reverted_line(path: &str) -> String {
