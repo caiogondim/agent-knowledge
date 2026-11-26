@@ -10,6 +10,8 @@ use common::{Folder, Peer, wait_for};
 // Long enough for an entry to cross the mesh several times, so a missing file is not a slow file.
 const SETTLE: Duration = Duration::from_secs(6);
 
+const STOP_LIMIT: Duration = Duration::from_secs(30);
+
 const CREATOR_V1: &str = "creator v1";
 
 fn write(dir: &Folder, name: &str, text: &str) {
@@ -35,9 +37,14 @@ async fn creator_mesh(creator_dir: &Folder, mounter_dirs: &[&Folder]) -> (String
     (hash, creator, mounters)
 }
 
+/// `Peer::stop` waits for the sync loop without a limit. A loop that does not end must fail the test.
+async fn stop(peer: Peer) {
+    tokio::time::timeout(STOP_LIMIT, peer.stop()).await.expect("a peer did not stop in time");
+}
+
 async fn stop_all(peers: Vec<Peer>) {
     for peer in peers {
-        peer.stop().await;
+        stop(peer).await;
     }
 }
 
@@ -55,7 +62,7 @@ async fn a_non_creator_write_is_not_applied_on_other_peers() {
     assert_eq!(read(&c_dir, "new.md"), None);
     assert_eq!(read(&c_dir, "base.md").as_deref(), Some(CREATOR_V1));
 
-    creator.stop().await;
+    stop(creator).await;
     stop_all(mounters).await;
 }
 
@@ -64,7 +71,7 @@ async fn the_folder_syncs_to_a_new_mounter_after_the_creator_leaves() {
     let (c_dir, a_dir, b_dir) = (Folder::new(), Folder::new(), Folder::new());
     let (hash, creator, mut mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
 
-    creator.stop().await;
+    stop(creator).await;
     mounters.push(Peer::mount(&b_dir, &hash));
     wait_for(&b_dir.path().join("base.md"), Some(CREATOR_V1)).await;
 
@@ -76,13 +83,13 @@ async fn a_rehoster_that_restarts_after_the_creator_left_still_serves() {
     let (c_dir, a_dir, b_dir) = (Folder::new(), Folder::new(), Folder::new());
     let (hash, creator, mut mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
 
-    creator.stop().await;
-    mounters.remove(0).stop().await;
+    stop(creator).await;
+    stop(mounters.remove(0)).await;
     let a = Peer::mount(&a_dir, &hash);
     let b = Peer::mount(&b_dir, &hash);
     wait_for(&b_dir.path().join("base.md"), Some(CREATOR_V1)).await;
 
-    tokio::join!(a.stop(), b.stop());
+    tokio::join!(stop(a), stop(b));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -96,7 +103,7 @@ async fn a_non_creator_edit_is_reverted_and_the_next_creator_change_applies() {
     wait_for(&a_dir.path().join("base.md"), Some("creator v2")).await;
     wait_for(&b_dir.path().join("base.md"), Some("creator v2")).await;
 
-    creator.stop().await;
+    stop(creator).await;
     stop_all(mounters).await;
 }
 
@@ -109,7 +116,7 @@ async fn a_non_creator_delete_is_reverted() {
     wait_for(&a_dir.path().join("base.md"), Some(CREATOR_V1)).await;
     assert_eq!(read(&c_dir, "base.md").as_deref(), Some(CREATOR_V1));
 
-    creator.stop().await;
+    stop(creator).await;
     stop_all(mounters).await;
 }
 
@@ -128,7 +135,7 @@ async fn a_mount_with_a_malformed_creator_suffix_fails() {
         stderr.contains("the creator key in the hash is not 64 lowercase hex digits of an Ed25519 key"),
         "unexpected error: {stderr}"
     );
-    creator.stop().await;
+    stop(creator).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -145,15 +152,15 @@ async fn a_mount_with_another_creator_key_applies_nothing() {
     tokio::time::sleep(SETTLE).await;
 
     assert_eq!(read(&b_dir, "base.md"), None);
-    creator.stop().await;
-    tokio::join!(a.stop(), b.stop());
+    stop(creator).await;
+    tokio::join!(stop(a), stop(b));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_only_peer_reverts_an_offline_edit_found_at_restart() {
     let (c_dir, a_dir) = (Folder::new(), Folder::new());
     let (hash, creator, mut mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
-    mounters.remove(0).stop().await;
+    stop(mounters.remove(0)).await;
 
     write(&a_dir, "base.md", "offline edit on a");
     let a = Peer::mount(&a_dir, &hash);
@@ -161,8 +168,8 @@ async fn a_read_only_peer_reverts_an_offline_edit_found_at_restart() {
     wait_for(&a_dir.path().join("base.md"), Some(CREATOR_V1)).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(read(&c_dir, "base.md").as_deref(), Some(CREATOR_V1));
-    creator.stop().await;
-    a.stop().await;
+    stop(creator).await;
+    stop(a).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -171,14 +178,39 @@ async fn a_mounter_keeps_its_own_file_at_a_tombstoned_path() {
     let (hash, creator, mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
     std::fs::remove_file(c_dir.path().join("base.md")).unwrap();
     wait_for(&a_dir.path().join("base.md"), None).await;
+    write(&c_dir, "marker.md", "marker");
 
     write(&b_dir, "base.md", "mine");
     let b = Peer::mount(&b_dir, &hash);
+    // The marker shows that B has the creator state, so a kept file is a decision and not a slow join.
+    wait_for(&b_dir.path().join("marker.md"), Some("marker")).await;
     tokio::time::sleep(SETTLE).await;
 
     assert_eq!(read(&b_dir, "base.md").as_deref(), Some("mine"));
-    creator.stop().await;
-    b.stop().await;
+    assert_eq!(read(&c_dir, "base.md"), None, "B's file reached the creator");
+    assert_eq!(read(&a_dir, "base.md"), None, "B's file reached the other mounter");
+    stop(creator).await;
+    stop(b).await;
+    stop_all(mounters).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mounter_keeps_a_file_made_after_join_at_a_tombstoned_path() {
+    let (c_dir, a_dir, b_dir) = (Folder::new(), Folder::new(), Folder::new());
+    let (_, creator, mounters) = creator_mesh(&c_dir, &[&a_dir, &b_dir]).await;
+    std::fs::remove_file(c_dir.path().join("base.md")).unwrap();
+    wait_for(&a_dir.path().join("base.md"), None).await;
+    wait_for(&b_dir.path().join("base.md"), None).await;
+
+    write(&b_dir, "base.md", "mine");
+    write(&c_dir, "marker.md", "marker");
+    wait_for(&b_dir.path().join("marker.md"), Some("marker")).await;
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(read(&b_dir, "base.md").as_deref(), Some("mine"));
+    assert_eq!(read(&c_dir, "base.md"), None, "B's file reached the creator");
+    assert_eq!(read(&a_dir, "base.md"), None, "B's file reached the other mounter");
+    stop(creator).await;
     stop_all(mounters).await;
 }
 
