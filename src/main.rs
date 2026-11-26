@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use agent_knowledge::memory::{self, Claim, Kind, Memory};
 use agent_knowledge::plug::{self, Agent};
+use agent_knowledge::sync::Target;
+use agent_knowledge::writers::Writers;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
@@ -16,7 +18,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Share a folder. Prints the hash that `mount` takes, then syncs until Ctrl-C.
-    Share { folder: PathBuf },
+    Share {
+        folder: PathBuf,
+        /// Who can change the share. With `creator`, a mounter applies only what this `share` run signed.
+        #[arg(long, value_enum, default_value_t)]
+        writers: Writers,
+    },
     /// Sync <target> with the folder that `share` printed <hash> for, until Ctrl-C.
     Mount { hash: String, target: PathBuf },
     /// Copy the knowledge-share and knowledge-mount skills into each agent's skills folder.
@@ -84,16 +91,16 @@ async fn main() -> anyhow::Result<()> {
         let _ = tokio::signal::ctrl_c().await;
     };
     match Cli::parse().command {
-        Command::Share { folder } => {
+        Command::Share { folder, writers } => {
             let _claim = claim(Kind::Share, &folder)?;
             let print_hash = |hash: &str| println!("{hash}");
-            agent_knowledge::sync::run(folder, None, known_dir()?, print_hash, shutdown).await
+            agent_knowledge::sync::run(folder, Target::Create(writers), known_dir()?, print_hash, shutdown).await
         }
         Command::Mount { hash, target } => {
             let _claim = claim(Kind::Mount, &target)?;
             std::fs::create_dir_all(&target)?;
             let announce = |_: &str| eprintln!("mounted at {}", target.display());
-            agent_knowledge::sync::run(target.clone(), Some(hash), known_dir()?, announce, shutdown).await
+            agent_knowledge::sync::run(target.clone(), Target::Join(hash), known_dir()?, announce, shutdown).await
         }
         Command::Plug { agents } => run_plug(agents),
         Command::Status => status(),

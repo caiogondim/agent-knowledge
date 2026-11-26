@@ -6,7 +6,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use agent_knowledge::sync;
+use agent_knowledge::sync::{self, Target};
+use agent_knowledge::writers::Writers;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -51,22 +52,27 @@ pub struct Peer {
 impl Peer {
     /// Shares `dir` and returns the peer with the hash that other peers mount.
     pub async fn share(folder: &Folder) -> (Self, String) {
+        Self::share_as(folder, Writers::Everybody).await
+    }
+
+    /// Like `share`, with the writer rule of the share.
+    pub async fn share_as(folder: &Folder, writers: Writers) -> (Self, String) {
         let (hash_tx, hash_rx) = oneshot::channel();
-        let peer = Self::spawn(folder, None, move |hash: &str| hash_tx.send(hash.to_owned()).unwrap());
+        let peer = Self::spawn(folder, Target::Create(writers), move |hash: &str| hash_tx.send(hash.to_owned()).unwrap());
         (peer, hash_rx.await.unwrap())
     }
 
     pub fn mount(folder: &Folder, hash: &str) -> Self {
-        Self::spawn(folder, Some(hash.to_owned()), |_: &str| {})
+        Self::spawn(folder, Target::Join(hash.to_owned()), |_: &str| {})
     }
 
-    fn spawn(folder: &Folder, mesh: Option<String>, on_ready: impl FnOnce(&str) + Send + 'static) -> Self {
+    fn spawn(folder: &Folder, target: Target, on_ready: impl FnOnce(&str) + Send + 'static) -> Self {
         let (stop, mut stop_rx) = watch::channel(());
         let stopped = async move {
             let _ = stop_rx.changed().await;
         };
         let known_dir = folder.known.path().to_path_buf();
-        let task = tokio::spawn(sync::run(folder.path().to_path_buf(), mesh, known_dir, on_ready, stopped));
+        let task = tokio::spawn(sync::run(folder.path().to_path_buf(), target, known_dir, on_ready, stopped));
         Self { stop, task }
     }
 

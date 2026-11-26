@@ -30,6 +30,7 @@ use tokio::task::JoinSet;
 use crate::scan::{self, resolve, sha256_bytes};
 use crate::view::View;
 use crate::watch::watch;
+use crate::writers::{self, CreatorKey, Writers};
 
 const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill. It
@@ -46,26 +47,37 @@ const FIRST_PUBLISH_WAIT: Duration = Duration::from_secs(5);
 const SLICE_BYTES: usize = 1_000_000;
 const ENTRY_BYTES: usize = 520;
 
-/// Sync `root` until `shutdown` resolves. With `mesh` `None`, create a new mesh; else join it.
-/// `known_dir` holds the last synced state of each folder and mesh, across restarts.
-/// `on_ready` gets the mesh id, which is the hash that `mount` takes.
+/// What `run` does with its folder: create a mesh under a writer rule, or join the mesh of a hash.
+pub enum Target {
+    Create(Writers),
+    /// The hash that `share` printed. A malformed hash is an error before any join.
+    Join(String),
+}
+
+/// Sync `root` until `shutdown` resolves. `known_dir` holds the last synced state of each folder
+/// and mesh, across restarts. `on_ready` gets the hash that `mount` takes.
 pub async fn run(
     root: PathBuf,
-    mesh: Option<String>,
+    target: Target,
     known_dir: PathBuf,
     on_ready: impl FnOnce(&str),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
+    let creator = matches!(target, Target::Create(_));
+    let (mesh, creator_key) = match target {
+        Target::Create(Writers::Everybody) => (None, None),
+        Target::Create(Writers::Creator) => (None, Some(CreatorKey::generate()?)),
+        Target::Join(hash) => (Some(writers::parse_hash(&hash)?.0), None),
+    };
     let (sink, mut events) = membership::json_sink();
-    let creator = mesh.is_none();
     let options = JoinOptions::default()
         .mesh(mesh)
         .name(Some(MESH_NAME.to_owned()))
         .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay]);
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     let mesh_id = wait_ready(&mut events).await?;
-    on_ready(&mesh_id);
+    on_ready(&writers::encode_hash(&mesh_id, creator_key.as_ref()));
 
     let blobs = BlobServer::start(LookupOpts::public_preset(), spool_dir(), None, PayloadPath::RelayAllowed)
         .await
@@ -150,11 +162,14 @@ struct Folder {
     known_file: PathBuf,
 }
 
-/// The `(sha256, clock)` of a path in our slice. A `None` sha256 is a tombstone.
+/// The `(sha256, clock)` of a path in our slice. A `None` sha256 is a tombstone. `sig` and `size`
+/// are those of the signed entry of a creator share, and `None` in an everybody share.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Known {
     sha256: Option<String>,
     clock: u64,
+    sig: Option<String>,
+    size: Option<u64>,
 }
 
 /// A change for our slice in the next write, and what `known` becomes when the write succeeds.
@@ -164,6 +179,8 @@ struct Download {
     path: String,
     sha256: String,
     clock: u64,
+    sig: Option<String>,
+    size: Option<u64>,
     tickets: Vec<String>,
     /// The sha256 of the file on disk when we planned the download. A change since then is a local
     /// edit, and it wins.
@@ -228,7 +245,7 @@ impl Folder {
                 }
                 return;
             };
-            let change = Known { sha256: disk, clock };
+            let change = Known { sha256: disk, clock, sig: None, size: None };
             return self.stage(path, change, pending).await;
         }
         let Some(winner) = winner else {
@@ -238,7 +255,8 @@ impl Folder {
             }
             return;
         };
-        let target = Known { sha256: winner.sha256.clone(), clock: winner.clock };
+        let target =
+            Known { sha256: winner.sha256.clone(), clock: winner.clock, sig: winner.sig.clone(), size: winner.size };
         // Our slice is level with the winner, or the view is behind a write of ours.
         if let Some(known) = known.as_ref().filter(|known| known.clock > winner.clock || **known == target) {
             if self.unadopted.contains(path) {
@@ -256,6 +274,8 @@ impl Folder {
                         path: path.to_owned(),
                         sha256: sha,
                         clock: winner.clock,
+                        sig: winner.sig,
+                        size: winner.size,
                         tickets: winner.tickets,
                         local_before: disk,
                     });
@@ -283,13 +303,19 @@ impl Folder {
     /// Stage an entry for our slice: a file with a ticket from our own blob server, or a tombstone.
     async fn stage(&self, path: &str, known: Known, pending: &mut Pending) {
         // A merge sets keys only, so each entry nulls the keys of the other kind.
-        let entry = match &known.sha256 {
+        let mut entry = match &known.sha256 {
             Some(sha) => match self.blobs.register(&self.root.join(path), ContentId::new(sha)).await {
                 Ok(ticket) => json!({ "sha256": sha, "ticket": ticket.encode(), "clock": known.clock, "deleted": null }),
                 Err(error) => return eprintln!("publish {path} failed: {error}"),
             },
             None => json!({ "deleted": true, "clock": known.clock, "sha256": null, "ticket": null }),
         };
+        if let Some(sig) = &known.sig {
+            entry["sig"] = json!(sig);
+        }
+        if let Some(size) = known.size {
+            entry["size"] = json!(size);
+        }
         pending.insert(path.to_owned(), (entry, known));
     }
 
@@ -332,7 +358,7 @@ impl Folder {
         eprintln!("↓ {}", download.path);
         self.disk.insert(download.path.clone(), download.sha256.clone());
         let mut pending = Pending::new();
-        let target = Known { sha256: Some(download.sha256), clock: download.clock };
+        let target = Known { sha256: Some(download.sha256), clock: download.clock, sig: download.sig, size: download.size };
         self.adopt(&download.path, target, &mut pending).await;
         self.write(pending).await;
     }
@@ -395,7 +421,10 @@ impl Folder {
         let known: serde_json::Map<String, Value> = self
             .known
             .iter()
-            .map(|(path, known)| (path.clone(), json!({ "sha256": known.sha256, "clock": known.clock })))
+            .map(|(path, known)| {
+                let saved = json!({ "sha256": known.sha256, "clock": known.clock, "sig": known.sig, "size": known.size });
+                (path.clone(), saved)
+            })
             .collect();
         let saved = self
             .known_file
@@ -493,7 +522,8 @@ fn load_known(file: &Path) -> BTreeMap<String, Known> {
         .into_iter()
         .filter_map(|(path, raw)| {
             let clock = raw.get("clock")?.as_u64()?;
-            Some((path, Known { sha256: raw.get("sha256").and_then(Value::as_str).map(str::to_owned), clock }))
+            let text = |key: &str| raw.get(key).and_then(Value::as_str).map(str::to_owned);
+            Some((path, Known { sha256: text("sha256"), clock, sig: text("sig"), size: raw.get("size").and_then(Value::as_u64) }))
         })
         .collect()
 }
@@ -532,4 +562,43 @@ fn spool_dir() -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let instance = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("agent-knowledge-{}-{instance}", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn saved(text: &str) -> BTreeMap<String, Known> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("known.json");
+        std::fs::write(&file, text).unwrap();
+        load_known(&file)
+    }
+
+    #[test]
+    fn a_known_file_from_before_signatures_loads_without_sig_and_size() {
+        let known = saved(r#"{"a.md":{"sha256":"ab","clock":3},"b.md":{"sha256":null,"clock":4}}"#);
+        assert_eq!(known["a.md"], Known { sha256: Some("ab".into()), clock: 3, sig: None, size: None });
+        assert_eq!(known["b.md"], Known { sha256: None, clock: 4, sig: None, size: None });
+    }
+
+    #[test]
+    fn sig_and_size_survive_a_save_and_a_load() {
+        let known = saved(r#"{"a.md":{"sha256":"ab","clock":3,"sig":"cd","size":7}}"#);
+        assert_eq!(known["a.md"], Known { sha256: Some("ab".into()), clock: 3, sig: Some("cd".into()), size: Some(7) });
+    }
+
+    #[tokio::test]
+    async fn a_malformed_creator_suffix_is_an_error_before_any_join() {
+        let (root, known) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let run = run(
+            root.path().to_path_buf(),
+            Target::Join("mesh.not-a-key".to_owned()),
+            known.path().to_path_buf(),
+            |_: &str| panic!("a malformed hash must not join"),
+            std::future::pending(),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(5), run).await.expect("run must fail fast").unwrap_err();
+        assert!(error.to_string().contains("creator key"), "{error}");
+    }
 }
