@@ -259,14 +259,15 @@ impl Folder {
         let local_change = disk != known_sha && !disk_is_winner && !mesh_wins;
         let reverts = local_change && self.read_only();
         // No live entry covers the path, so a read-only peer has nothing to revert the file to. It
-        // keeps the file, and a file that the mesh never gave it is not deleted by a tombstone.
+        // keeps the file. A tombstone does not delete a file whose bytes the mesh never gave it.
         let nothing_to_revert = reverts
             && match &winner {
                 None => true,
-                Some(winner) => winner.sha256.is_none() && known.is_none(),
+                Some(winner) => winner.sha256.is_none() && known_sha.is_none(),
             };
         if nothing_to_revert {
-            if self.unpublished.insert(path.to_owned()) {
+            // Before the first mesh view, a file may still be one that the mesh holds.
+            if self.can_publish && disk.is_some() && self.unpublished.insert(path.to_owned()) {
                 eprintln!("read-only share: not published {path}");
             }
             if winner.is_some() {
@@ -368,6 +369,9 @@ impl Folder {
     /// A file that does not match its sha256 on disk would get a dead ticket, so it stays out. A
     /// read-only peer passes on only the signature that it got.
     async fn sealed(&self, path: &str, mut known: Known) -> Option<Known> {
+        if self.read_only() && known.sig.is_none() {
+            return None;
+        }
         let Some(sha256) = known.sha256.clone() else {
             if let Some(key) = &self.creator_key {
                 known.sig = Some(key.sign(&self.mesh_id, &Signed::Tombstone { path, clock: known.clock }));
@@ -384,7 +388,7 @@ impl Folder {
             known.sig = Some(key.sign(&self.mesh_id, &signed));
             known.size = Some(size);
         }
-        (!self.read_only() || known.sig.is_some()).then_some(known)
+        Some(known)
     }
 
     /// In a creator share every peer but the creator only follows.
