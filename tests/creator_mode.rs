@@ -123,7 +123,11 @@ async fn a_mount_with_a_malformed_creator_suffix_fails() {
     let output = mount_output(&format!("{}.zz", mesh_of(&hash)), target.path(), home.path());
 
     assert!(!output.status.success(), "mount joined with a malformed suffix");
-    assert!(!output.stderr.is_empty(), "mount failed without an error message");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the creator key in the hash is not 64 lowercase hex digits of an Ed25519 key"),
+        "unexpected error: {stderr}"
+    );
     creator.stop().await;
 }
 
@@ -143,6 +147,39 @@ async fn a_mount_with_another_creator_key_applies_nothing() {
     assert_eq!(read(&b_dir, "base.md"), None);
     creator.stop().await;
     tokio::join!(a.stop(), b.stop());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_peer_reverts_an_offline_edit_found_at_restart() {
+    let (c_dir, a_dir) = (Folder::new(), Folder::new());
+    let (hash, creator, mut mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
+    mounters.remove(0).stop().await;
+
+    write(&a_dir, "base.md", "offline edit on a");
+    let a = Peer::mount(&a_dir, &hash);
+
+    wait_for(&a_dir.path().join("base.md"), Some(CREATOR_V1)).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(read(&c_dir, "base.md").as_deref(), Some(CREATOR_V1));
+    creator.stop().await;
+    a.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mounter_keeps_its_own_file_at_a_tombstoned_path() {
+    let (c_dir, a_dir, b_dir) = (Folder::new(), Folder::new(), Folder::new());
+    let (hash, creator, mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
+    std::fs::remove_file(c_dir.path().join("base.md")).unwrap();
+    wait_for(&a_dir.path().join("base.md"), None).await;
+
+    write(&b_dir, "base.md", "mine");
+    let b = Peer::mount(&b_dir, &hash);
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(read(&b_dir, "base.md").as_deref(), Some("mine"));
+    creator.stop().await;
+    b.stop().await;
+    stop_all(mounters).await;
 }
 
 fn mount_output(hash: &str, target: &Path, home: &Path) -> std::process::Output {
