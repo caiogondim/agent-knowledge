@@ -99,8 +99,8 @@ prints a new hash.
 - After the creator leaves, a peer that holds the folder can withhold the
   newest signed entry. A new mounter can then get an older version of a file,
   or a file that the creator deleted.
-- A build without creator mode, given the bare mesh id of a creator share,
-  runs in `everybody` mode.
+- Any build, given the bare mesh id of a creator share, runs in `everybody`
+  mode. This includes a build with creator mode.
 - The blob ticket is not signed. A member can point readers at its own blob
   server. The cost is bounded by the signed size of the file.
 - Each entry is larger, so a slice holds fewer files. See [Limits](#limits).
@@ -188,7 +188,7 @@ cargo clippy
 - **Echo stop:** each side keeps the last synced sha256 of each path. A change that matches it is the side's own echo, so the side skips it.
 - **Conflicts:** for each path, the entry with the highest `clock` wins. On a tie, a file beats a delete, and between 2 files the larger sha256 wins. A local change gets a clock 1 above the highest clock in all slices.
 - **Adoption:** a peer that applies a winner copies it into its own slice, with its own blob ticket. So the folder survives when the share stops, and a fetch has more than 1 source.
-- **Restart:** each peer saves the last synced state of each path, for each mesh and folder, in `$AGENT_KNOWLEDGE_HOME/known/` (default `~/.agent-knowledge/known/`). A file that differs from it at start is an offline edit, and it wins. A saved delete is published again too.
+- **Restart:** each peer saves the last synced state of each path, for each mesh and folder, in `$AGENT_KNOWLEDGE_HOME/known/` (default `~/.agent-knowledge/known/`). A file that differs from it at start is an offline edit, and it wins. A saved delete is published again too. A mounter of a creator share is the exception: it never publishes an offline edit, and it puts the creator version back (see [Writers](#writers)).
 - **Join:** a file in the folder at join that no earlier run synced yields to the mesh. If a peer already holds that path as a file, its version overwrites the file. A path that no peer holds, or that peers deleted, is published.
 
 ### Limits

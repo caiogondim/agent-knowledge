@@ -43,7 +43,9 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
    `cargo install --git https://github.com/caiogondim/agent-knowledge`.
 
 4. **Run it in the background.** It runs until stopped, so never wait on it
-   in the foreground.
+   in the foreground. By default, each peer can change files. If the user
+   wants only the creator to change files, add `--writers creator` after the
+   folder in each command below.
    - Claude Code: call Bash with `run_in_background: true` and run
      `agent-knowledge share "<absolute-folder>"`.
    - Codex and Pi: their shell tool waits for the command to end, so detach

@@ -52,6 +52,18 @@ agent-knowledge status
 
 Confirm `<bank>` is a directory.
 
+A mounted bank can be read-only. In a share that runs with `--writers creator`,
+only the creator can change files. A mounter gets a read-only copy, and its
+sync puts back the creator version of each file that the mounter changes.
+
+- **Before you write:** if this session mounted a hash that has a `.<key>`
+  suffix (`<mesh-id>.<64 hex characters>`), the bank is read-only. Stop, write
+  nothing, and tell the user that only the creator of the share can write.
+- **After you write:** the mount prints `read-only share: reverted <path>` on
+  stderr when it puts a file back. If you see this line for a path that you
+  wrote, or if that file does not hold your content after a few seconds, the
+  write failed. Report the failure. Never report success.
+
 ## 2. Decide what to change
 
 Use the arguments (see Agent differences) and the conversation. If there is
@@ -160,4 +172,4 @@ Re-read each file just before writing it: a peer may have changed it.
 Check that each file written has frontmatter that parses as YAML with a
 non-empty `type`. Then tell the user each path changed and how (created,
 updated, renamed, deleted), and that peers receive the change within a few
-seconds.
+seconds. Do this only if the bank is writable (see step 1).
