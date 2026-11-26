@@ -31,8 +31,10 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
    absolute path and confirm it exists and is a directory. Stop with a clear
    message if not.
 
-2. **Warn before sharing.** Sharing is two-way: anyone with the hash can edit,
-   create, and delete files in this folder. Say this in one line. If the folder
+2. **Warn before sharing.** Sharing is two-way by default: anyone with the hash
+   can edit, create, and delete files in this folder. With
+   `--writers creator`, only the creator can change files, and a peer gets a
+   read-only copy. Say this in one line. If the folder
    is the user's home directory, a whole project root, or holds secrets
    (`.env`, keys), ask for confirmation first.
 

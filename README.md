@@ -48,6 +48,63 @@ replaces older copies:
 pick agents, use `--agent claude-code`, `--agent codex`, or `--agent pi`, one
 or more times. Restart the agent to load the skills.
 
+### Writers
+
+By default, each peer that holds the hash can create, edit, and delete files.
+To let only the creator change files, start the share with `--writers creator`:
+
+```bash
+agent-knowledge share <folder> --writers creator
+```
+
+| Value | Who can change files |
+|---|---|
+| `everybody` (default) | Each peer that holds the hash. |
+| `creator` | Only the `share` process that made the hash. |
+
+In creator mode, `share` makes a new signing key at each start. The key stays
+in memory. The creator signs each entry of the file list with this key. A peer
+applies an entry only if the signature is valid.
+
+The hash of a creator share has a second form:
+
+```text
+<mesh-id>.<creator-public-key>
+```
+
+The creator public key is 64 lowercase hex characters. The hash of an
+`everybody` share is only the mesh id.
+
+A mounter uses the same command: `agent-knowledge mount <hash> <target>`. The
+mounter takes the creator key only from the hash. If the part after the first
+`.` is not the 64 lowercase hex characters of a valid Ed25519 public key,
+`mount` does not join. It prints `the creator key in the hash is not 64
+lowercase hex digits of an Ed25519 key` and exits with an error. An empty part
+and a part with another `.` give the same error.
+
+A mounter of a creator share gets a read-only copy:
+
+- The folder follows the creator.
+- A mounter never publishes an edit, a create, or a delete.
+- If a mounter changes a file, `mount` puts the creator version back. It
+  prints `read-only share: reverted <path>` on stderr, 1 line for each path.
+- The same happens when `mount` starts and finds an offline edit.
+
+If the creator process stops, nobody can sign again. The share stays
+read-only for ever. To change files again, run `share` again. The new run
+prints a new hash.
+
+#### Known limits of creator mode
+
+- After the creator leaves, a peer that holds the folder can withhold the
+  newest signed entry. A new mounter can then get an older version of a file,
+  or a file that the creator deleted.
+- A build without creator mode, given the bare mesh id of a creator share,
+  runs in `everybody` mode.
+- The blob ticket is not signed. A member can point readers at its own blob
+  server. The cost is bounded by the signed size of the file.
+- Each entry is larger, so a slice holds fewer files. See [Limits](#limits).
+
 ## Install
 
 The skills call `agent-knowledge` from `PATH`, so install the binary before
@@ -125,7 +182,7 @@ cargo clippy
 
 ### How it works
 
-- **The hash** is a habilis-network mesh id. The mesh uses all lookups: mDNS, DHT, and relay.
+- **The hash** is a habilis-network mesh id. In creator mode, the hash also holds the creator public key (see [Writers](#writers)). The mesh uses all lookups: mDNS, DHT, and relay.
 - **The file list** is the mesh `state` document. Each peer writes its full view of the folder into its own signed slice. Each entry holds the sha256 of a file, a blob ticket, and a `clock`. A delete is an entry with `deleted: true`.
 - **The file bytes** go through the blob ticket, because a gossip frame holds at most 3840 bytes. A download runs in the background and fails when no byte arrives for 10 s.
 - **Echo stop:** each side keeps the last synced sha256 of each path. A change that matches it is the side's own echo, so the side skips it.
@@ -140,5 +197,5 @@ cargo clippy
 - Empty folders do not sync.
 - A rename syncs as a delete plus a create.
 - Each side keeps a full copy of the folder.
-- One slice holds at most 1 MiB. An entry takes about 520 bytes, so a folder holds about 2000 files, deleted files included. Delete entries are never removed. Above the limit, a peer logs an error and stops publishing. It still downloads.
+- One slice holds at most 1 MiB. In `everybody` mode, an entry takes about 520 bytes, so a folder holds about 2000 files. In `creator` mode, an entry takes about 680 bytes, so a folder holds about 1500 files. Both counts include deleted files. Delete entries are never removed. Above the limit, a peer logs an error and stops publishing. It still downloads.
 - Peers that run an older build do not meet peers that run this one: the mesh ids differ.
