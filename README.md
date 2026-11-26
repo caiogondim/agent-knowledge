@@ -89,6 +89,10 @@ A mounter of a creator share gets a read-only copy:
 - If a mounter changes a file, `mount` puts the creator version back. It
   prints `read-only share: reverted <path>` on stderr, 1 line for each path.
 - The same happens when `mount` starts and finds an offline edit.
+- If a mounter has a file at a path that the creator deleted, and the mesh
+  never gave the mounter that file, the file stays. This includes a file that
+  the mounter creates after it joins. `mount` does not publish the file. It
+  prints `read-only share: not published <path>` on stderr.
 
 If the creator process stops, nobody can sign again. The share stays
 read-only for ever. To change files again, run `share` again. The new run
@@ -189,7 +193,7 @@ cargo clippy
 - **Conflicts:** for each path, the entry with the highest `clock` wins. On a tie, a file beats a delete, and between 2 files the larger sha256 wins. A local change gets a clock 1 above the highest clock in all slices.
 - **Adoption:** a peer that applies a winner copies it into its own slice, with its own blob ticket. So the folder survives when the share stops, and a fetch has more than 1 source.
 - **Restart:** each peer saves the last synced state of each path, for each mesh and folder, in `$AGENT_KNOWLEDGE_HOME/known/` (default `~/.agent-knowledge/known/`). A file that differs from it at start is an offline edit, and it wins. A saved delete is published again too. A mounter of a creator share is the exception: it never publishes an offline edit, and it puts the creator version back (see [Writers](#writers)).
-- **Join:** a file in the folder at join that no earlier run synced yields to the mesh. If a peer already holds that path as a file, its version overwrites the file. A path that no peer holds, or that peers deleted, is published.
+- **Join:** a file in the folder at join that no earlier run synced yields to the mesh. If a peer already holds that path as a file, its version overwrites the file. A path that no peer holds, or that peers deleted, is published. A mounter of a creator share never publishes it (see [Writers](#writers)).
 
 ### Limits
 
