@@ -93,6 +93,9 @@ A mounter of a creator share gets a read-only copy:
   never gave the mounter that file, the file stays. This includes a file that
   the mounter creates after it joins. `mount` does not publish the file. It
   prints `read-only share: not published <path>` on stderr.
+- A new file of a mounter, at a path that the creator never shared, also
+  stays on the mounter. `mount` does not publish it. It prints the same
+  `read-only share: not published <path>` line.
 
 If the creator process stops, nobody can sign again. The share stays
 read-only for ever. To change files again, run `share` again. The new run
@@ -107,6 +110,8 @@ prints a new hash.
   mode. This includes a build with creator mode.
 - The blob ticket is not signed. A member can point readers at its own blob
   server. The cost is bounded by the signed size of the file.
+- A peer that keeps its own file at a deleted path does not rehost that
+  delete.
 - Each entry is larger, so a slice holds fewer files. See [Limits](#limits).
 
 ## Install

@@ -59,10 +59,13 @@ sync puts back the creator version of each file that the mounter changes.
 - **Before you write:** if this session mounted a hash that has a `.<key>`
   suffix (`<mesh-id>.<64 hex characters>`), the bank is read-only. Stop, write
   nothing, and tell the user that only the creator of the share can write.
-- **After you write:** the mount prints `read-only share: reverted <path>` on
-  stderr when it puts a file back. If you see this line for a path that you
-  wrote, or if that file does not hold your content after a few seconds, the
-  write failed. Report the failure. Never report success.
+- **After you write:** the mount prints a line on stderr for a file that it
+  does not accept. `read-only share: reverted <path>` means it put the
+  creator version back. `read-only share: not published <path>` means it
+  keeps your file on this machine and does not send it to the other peers. If
+  you see either line for a path that you wrote, or if that file does not hold
+  your content after a few seconds, the write failed for the other peers.
+  Report the failure. Never report success.
 
 ## 2. Decide what to change
 
