@@ -6,6 +6,10 @@
 //! holds a blob ticket that a peer redeems against the blob server of the author. A peer that
 //! applies a winner copies it into its own slice with its own ticket, so the folder survives
 //! when the share leaves.
+//!
+//! In a creator share ([`Writers::Creator`]) the creator signs each entry, and a peer applies only
+//! entries that verify against the key in the hash. Every other peer is read-only: a local edit is
+//! reverted to the winner and never published.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -30,7 +34,7 @@ use tokio::task::JoinSet;
 use crate::scan::{self, resolve, sha256_bytes};
 use crate::view::View;
 use crate::watch::watch;
-use crate::writers::{self, CreatorKey, Writers};
+use crate::writers::{self, CreatorKey, Signed, Trust, Writers};
 
 const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill. It
@@ -42,10 +46,12 @@ const MAX_FETCHES: usize = 8;
 /// A joiner waits this long for a slice that holds files before its first publish.
 const FIRST_PUBLISH_WAIT: Duration = Duration::from_secs(5);
 /// One slice holds at most 1 MiB. An entry is about 520 bytes: a 407 byte ticket (measured), a
-/// 64 byte sha256, the keys and the clock. That is about 2000 entries. The estimate is a first
-/// guard. The refusal of the mesh is the last one, because a ticket changes in length by host.
+/// 64 byte sha256, the keys and the clock. That is about 2000 entries. A creator entry also holds
+/// a 128 byte signature and a size, which makes about 680 bytes. The estimate is a first guard.
+/// The refusal of the mesh is the last one, because a ticket changes in length by host.
 const SLICE_BYTES: usize = 1_000_000;
-const ENTRY_BYTES: usize = 520;
+const ENTRY_BYTES_EVERYBODY: usize = 520;
+const ENTRY_BYTES_CREATOR: usize = 680;
 
 /// What `run` does with its folder: create a mesh under a writer rule, or join the mesh of a hash.
 pub enum Target {
@@ -65,10 +71,10 @@ pub async fn run(
 ) -> Result<()> {
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let creator = matches!(target, Target::Create(_));
-    let (mesh, creator_key) = match target {
-        Target::Create(Writers::Everybody) => (None, None),
-        Target::Create(Writers::Creator) => (None, Some(CreatorKey::generate()?)),
-        Target::Join(hash) => (Some(writers::parse_hash(&hash)?.0), None),
+    let (mesh, creator_key, joined_hash) = match target {
+        Target::Create(Writers::Everybody) => (None, None, None),
+        Target::Create(Writers::Creator) => (None, Some(CreatorKey::generate()?), None),
+        Target::Join(hash) => (Some(writers::parse_hash(&hash)?.0), None, Some(hash)),
     };
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
@@ -77,7 +83,9 @@ pub async fn run(
         .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay]);
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     let mesh_id = wait_ready(&mut events).await?;
-    on_ready(&writers::encode_hash(&mesh_id, creator_key.as_ref()));
+    let hash = joined_hash.unwrap_or_else(|| writers::encode_hash(&mesh_id, creator_key.as_ref()));
+    let (_, trust) = writers::parse_hash(&hash)?;
+    on_ready(&hash);
 
     let blobs = BlobServer::start(LookupOpts::public_preset(), spool_dir(), None, PayloadPath::RelayAllowed)
         .await
@@ -87,6 +95,9 @@ pub async fn run(
     let known = load_known(&known_file);
     let mut folder = Folder {
         root,
+        mesh_id,
+        trust,
+        creator_key,
         member,
         blobs,
         unadopted: known.keys().cloned().collect(),
@@ -134,6 +145,11 @@ pub async fn run(
 
 struct Folder {
     root: PathBuf,
+    /// The bare mesh id, without the creator key of the hash. A signature covers it.
+    mesh_id: String,
+    trust: Trust,
+    /// Only the creator of a creator share holds it.
+    creator_key: Option<CreatorKey>,
     member: Membership,
     blobs: BlobServer,
     /// The `(sha256, clock)` of each path as the disk and this peer last agreed on it. A watcher
@@ -185,6 +201,8 @@ struct Download {
     /// The sha256 of the file on disk when we planned the download. A change since then is a local
     /// edit, and it wins.
     local_before: Option<String>,
+    /// The download undoes a local change of a read-only peer.
+    reverts: bool,
 }
 
 struct Fetched {
@@ -208,7 +226,7 @@ impl Folder {
             self.at_join = Some(unsynced.map(|(path, sha)| (path.clone(), sha.clone())).collect());
         }
         let Some(document) = self.document().await else { return };
-        let view = View::parse(&document, &crate::writers::Trust::Everybody);
+        let view = View::parse(&document, &self.trust);
         self.can_publish |= !view.is_empty();
         let mut pending = Pending::new();
         let paths: BTreeSet<String> =
@@ -232,9 +250,12 @@ impl Folder {
             && winner.as_ref().is_some_and(|winner| winner.sha256.is_some())
             && self.at_join.as_ref().and_then(|at_join| at_join.get(path)) == disk.as_ref();
 
+        let local_change = disk != known_sha && !disk_is_winner && !mesh_wins;
+        let reverts = local_change && self.read_only();
+
         // A change on disk that no slice holds yet wins over everything: publish it above the
-        // highest clock.
-        if disk != known_sha && !disk_is_winner && !mesh_wins {
+        // highest clock. A read-only peer follows the winner instead.
+        if local_change && !reverts {
             if !self.can_publish {
                 return;
             }
@@ -258,7 +279,8 @@ impl Folder {
         let target =
             Known { sha256: winner.sha256.clone(), clock: winner.clock, sig: winner.sig.clone(), size: winner.size };
         // Our slice is level with the winner, or the view is behind a write of ours.
-        if let Some(known) = known.as_ref().filter(|known| known.clock > winner.clock || **known == target) {
+        let level = |known: &&Known| known.clock > winner.clock || **known == target;
+        if let Some(known) = known.as_ref().filter(level).filter(|_| !reverts) {
             if self.unadopted.contains(path) {
                 self.stage(path, known.clone(), pending).await;
             }
@@ -278,6 +300,7 @@ impl Folder {
                         size: winner.size,
                         tickets: winner.tickets,
                         local_before: disk,
+                        reverts,
                     });
                 }
             }
@@ -285,7 +308,7 @@ impl Folder {
                 if let Some(local) = resolve(&self.root, path).filter(|local| file_sha(local) == disk)
                     && std::fs::remove_file(local).is_ok()
                 {
-                    eprintln!("↓ deleted {path}");
+                    eprintln!("{}", if reverts { reverted_line(path) } else { format!("↓ deleted {path}") });
                 }
                 self.disk.remove(path);
                 self.adopt(path, target, pending).await;
@@ -302,6 +325,7 @@ impl Folder {
 
     /// Stage an entry for our slice: a file with a ticket from our own blob server, or a tombstone.
     async fn stage(&self, path: &str, known: Known, pending: &mut Pending) {
+        let Some(known) = self.sealed(path, known) else { return };
         // A merge sets keys only, so each entry nulls the keys of the other kind.
         let mut entry = match &known.sha256 {
             Some(sha) => match self.blobs.register(&self.root.join(path), ContentId::new(sha)).await {
@@ -319,12 +343,47 @@ impl Folder {
         pending.insert(path.to_owned(), (entry, known));
     }
 
+    /// The entry as it goes into our slice, or `None` if it must not go in. The creator signs it.
+    /// A file that does not match its sha256 on disk would get a dead ticket, so it stays out. A
+    /// read-only peer passes on only the signature that it got.
+    fn sealed(&self, path: &str, mut known: Known) -> Option<Known> {
+        let Some(sha256) = known.sha256.clone() else {
+            if let Some(key) = &self.creator_key {
+                known.sig = Some(key.sign(&self.mesh_id, &Signed::Tombstone { path, clock: known.clock }));
+            }
+            return Some(known);
+        };
+        let bytes = std::fs::read(self.root.join(path)).ok()?;
+        if sha256_bytes(&bytes) != sha256 {
+            return None;
+        }
+        if let Some(key) = &self.creator_key {
+            let size = u64::try_from(bytes.len()).ok()?;
+            let signed = Signed::File { path, clock: known.clock, sha256: &sha256, size };
+            known.sig = Some(key.sign(&self.mesh_id, &signed));
+            known.size = Some(size);
+        }
+        (!self.read_only() || known.sig.is_some()).then_some(known)
+    }
+
+    /// In a creator share every peer but the creator only follows.
+    fn read_only(&self) -> bool {
+        matches!(self.trust, Trust::Creator { .. }) && self.creator_key.is_none()
+    }
+
+    fn entry_bytes(&self) -> usize {
+        match self.trust {
+            Trust::Everybody => ENTRY_BYTES_EVERYBODY,
+            Trust::Creator { .. } => ENTRY_BYTES_CREATOR,
+        }
+    }
+
     fn spawn_fetch(&mut self, download: Download) {
         self.in_flight.insert(download.path.clone(), (download.clock, download.sha256.clone()));
         let slots = Arc::clone(&self.fetch_slots);
         self.fetches.spawn(async move {
             let _slot = slots.acquire_owned().await;
-            let result = fetch_any(download.tickets.clone(), download.sha256.clone()).await;
+            let result = fetch_any(download.tickets.clone(), download.sha256.clone(), download.size).await;
             Fetched { download, result }
         });
     }
@@ -355,7 +414,7 @@ impl Folder {
         if let Err(error) = write_atomic(&local, &bytes).await {
             return eprintln!("download {} failed: {error:#}", download.path);
         }
-        eprintln!("↓ {}", download.path);
+        eprintln!("{}", if download.reverts { reverted_line(&download.path) } else { format!("↓ {}", download.path) });
         self.disk.insert(download.path.clone(), download.sha256.clone());
         let mut pending = Pending::new();
         let target = Known { sha256: Some(download.sha256), clock: download.clock, sig: download.sig, size: download.size };
@@ -369,7 +428,7 @@ impl Folder {
             return;
         }
         let entries: BTreeSet<&String> = self.known.keys().chain(pending.keys()).collect();
-        let bytes: usize = entries.iter().map(|path| path.len() + ENTRY_BYTES).sum();
+        let bytes: usize = entries.iter().map(|path| path.len() + self.entry_bytes()).sum();
         if bytes > SLICE_BYTES {
             return self.cap();
         }
@@ -443,12 +502,17 @@ enum Merge {
     Failed(anyhow::Error),
 }
 
-/// Try every ticket for the same bytes at once. The first that verifies wins.
-async fn fetch_any(tickets: Vec<String>, sha256: String) -> Result<Vec<u8>> {
+fn reverted_line(path: &str) -> String {
+    format!("read-only share: reverted {path}")
+}
+
+/// Try every ticket for the same bytes at once. The first that verifies wins. A fetch stops when
+/// the bytes pass `max_bytes`, the size that the creator signed.
+async fn fetch_any(tickets: Vec<String>, sha256: String, max_bytes: Option<u64>) -> Result<Vec<u8>> {
     let mut fetches = JoinSet::new();
     for ticket in tickets {
         let sha256 = sha256.clone();
-        fetches.spawn(async move { fetch_one(&ticket, &sha256).await });
+        fetches.spawn(async move { fetch_one(&ticket, &sha256, max_bytes).await });
     }
     let mut last = anyhow!("no peer holds these bytes");
     while let Some(joined) = fetches.join_next().await {
@@ -461,11 +525,11 @@ async fn fetch_any(tickets: Vec<String>, sha256: String) -> Result<Vec<u8>> {
     Err(last)
 }
 
-async fn fetch_one(ticket: &str, sha256: &str) -> Result<Vec<u8>> {
+async fn fetch_one(ticket: &str, sha256: &str, max_bytes: Option<u64>) -> Result<Vec<u8>> {
     let ticket = BlobTicket::decode(ticket).map_err(|error| anyhow!("{error}"))?;
     let clock = Instant::now();
     let last_byte = Arc::new(AtomicU64::new(0));
-    let mut sink = Sink { bytes: Vec::new(), clock, last_byte: Arc::clone(&last_byte) };
+    let mut sink = Sink { bytes: Vec::new(), max_bytes, clock, last_byte: Arc::clone(&last_byte) };
     let stalled = async {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -488,12 +552,18 @@ async fn fetch_one(ticket: &str, sha256: &str) -> Result<Vec<u8>> {
 /// Collects the bytes of a fetch, and notes when the last byte came.
 struct Sink {
     bytes: Vec<u8>,
+    /// A write that would pass it fails.
+    max_bytes: Option<u64>,
     clock: Instant,
     last_byte: Arc<AtomicU64>,
 }
 
 impl AsyncWrite for Sink {
     fn poll_write(mut self: Pin<&mut Self>, _: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let total = u64::try_from(self.bytes.len() + buf.len()).unwrap_or(u64::MAX);
+        if self.max_bytes.is_some_and(|max| total > max) {
+            return Poll::Ready(Err(std::io::Error::other("more bytes than the signed size")));
+        }
         self.bytes.extend_from_slice(buf);
         let millis = u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_byte.store(millis, Ordering::Relaxed);
