@@ -58,6 +58,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
  "habilis-network",
  "hex",
  "notify",

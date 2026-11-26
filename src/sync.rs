@@ -191,7 +191,7 @@ impl Folder {
             self.at_join = Some(unsynced.map(|(path, sha)| (path.clone(), sha.clone())).collect());
         }
         let Some(document) = self.document().await else { return };
-        let view = View::parse(&document);
+        let view = View::parse(&document, &crate::writers::Trust::Everybody);
         self.can_publish |= !view.is_empty();
         let mut pending = Pending::new();
         let paths: BTreeSet<String> =
