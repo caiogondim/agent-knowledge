@@ -5,6 +5,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use zeroize::Zeroizing;
 
 /// The `--writers` flag of `share`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -41,8 +42,8 @@ const SIGNATURE_HEX_LEN: usize = 128;
 
 impl CreatorKey {
     pub fn generate() -> Result<Self> {
-        let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret).map_err(|error| anyhow!("no random bytes for the creator key: {error}"))?;
+        let mut secret = Zeroizing::new([0u8; 32]);
+        getrandom::fill(secret.as_mut()).map_err(|error| anyhow!("no random bytes for the creator key: {error}"))?;
         Ok(Self(SigningKey::from_bytes(&secret)))
     }
 
